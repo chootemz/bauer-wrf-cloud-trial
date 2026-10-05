@@ -1,0 +1,119 @@
+name: Publish verified Bauer WRF inputs
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/publish-wrf-inputs.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-bauer-wrf-inputs
+  cancel-in-progress: false
+
+jobs:
+  transfer:
+    if: github.repository == 'chootemz/bauer-wrf-cloud-trial'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Verify scientific package and attach missing release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import http.cookiejar
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          repo = 'chootemz/bauer-wrf-cloud-trial'
+          tag = 'wrf-trial-v2'
+          archive = 'bauer-wrf-trial-20261003T14Z.tar.gz'
+          expected = {
+              archive: (592279383, '047644192d6a80d5f6c4dffc80f6d7c0e5d37740c3d5ea174211a962fdc66e36'),
+              archive + '.sha256': (102, 'c05db55077d8fca8065d271e30c937d8b3df0a6436d3b622dabd1f0109fc7a07'),
+          }
+          source = 'https://filebin.net/9de59d2557554b11bf03f723ee2c8a4d/'
+          headers = {
+              'Accept': 'application/vnd.github+json',
+              'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+              'User-Agent': 'Bauer-WRF-input-transfer',
+          }
+
+          def github(url):
+              with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as response:
+                  return json.load(response)
+
+          release_url = f'https://api.github.com/repos/{repo}/releases/tags/{tag}'
+          release = github(release_url)
+          if release['draft'] or release['tag_name'] != tag:
+              raise RuntimeError('Expected published frozen trial release')
+          upload_base = release['upload_url'].split('{', 1)[0]
+          if not upload_base.startswith(f'https://uploads.github.com/repos/{repo}/releases/'):
+              raise RuntimeError('Unexpected release upload destination')
+          opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+
+          for name, (size, digest) in expected.items():
+              assets = {item['name']: item for item in github(release_url)['assets']}
+              if name in assets:
+                  asset = assets[name]
+                  if asset['size'] != size or asset.get('digest') not in (None, 'sha256:' + digest):
+                      raise RuntimeError('Existing asset differs; preserving it: ' + name)
+                  print('Existing asset preserved:', asset['browser_download_url'], flush=True)
+                  continue
+              path = Path(name)
+              received = False
+              for attempt in range(2):
+                  with opener.open(source + urllib.parse.quote(name), timeout=120) as response:
+                      if response.headers.get_content_type() == 'text/html':
+                          response.read(65536)
+                          continue
+                      hasher = hashlib.sha256()
+                      count = 0
+                      with path.open('wb') as output:
+                          while chunk := response.read(1024 * 1024):
+                              count += len(chunk)
+                              if count > size:
+                                  raise RuntimeError('Source exceeded expected length')
+                              output.write(chunk)
+                              hasher.update(chunk)
+                      if count != size or hasher.hexdigest() != digest:
+                          raise RuntimeError('Transferred file failed its pinned size or checksum')
+                      received = True
+                      break
+              if not received:
+                  raise RuntimeError('Filebin download confirmation did not complete')
+              print('Verified:', name, count, digest, flush=True)
+              # Check again after downloading in case the laptop upload completed.
+              assets = {item['name']: item for item in github(release_url)['assets']}
+              if name in assets:
+                  asset = assets[name]
+                  if asset['size'] != size or asset.get('digest') not in (None, 'sha256:' + digest):
+                      raise RuntimeError('Concurrent asset differs; preserving it: ' + name)
+                  print('Concurrent upload preserved:', asset['browser_download_url'], flush=True)
+                  continue
+              with path.open('rb') as payload:
+                  request = urllib.request.Request(
+                      upload_base + '?name=' + urllib.parse.quote(name), data=payload, method='POST',
+                      headers={**headers, 'Content-Type': 'application/octet-stream', 'Content-Length': str(size)})
+                  with urllib.request.urlopen(request, timeout=600) as response:
+                      asset = json.load(response)
+              if asset['size'] != size or asset.get('digest') not in (None, 'sha256:' + digest):
+                  raise RuntimeError('Uploaded asset verification failed')
+              print('Attached:', asset['browser_download_url'], flush=True)
+
+          final_assets = {item['name']: item for item in github(release_url)['assets']}
+          if not all(name in final_assets and final_assets[name]['size'] == info[0] for name, info in expected.items()):
+              raise RuntimeError('Published release lacks the complete verified input pair')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('Verified WRF input transfer completed. No WRF solver was run.\n\n')
+              for name in expected:
+                  summary.write(f"- [{name}]({final_assets[name]['browser_download_url']})\n")
+          PY
